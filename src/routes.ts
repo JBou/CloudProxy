@@ -228,7 +228,7 @@ async function setupPage(ctx: Context, params: BaseRequestAPICall, browser: Brow
   const page = await browser.newPage()
 
   // merge session defaults with params
-  const { method, postData, userAgent, headers, cookies } = params
+  const { method, postData, download, userAgent, headers, cookies } = params
 
   let overrideResolvers: OverrideResolvers = {}
 
@@ -245,6 +245,11 @@ async function setupPage(ctx: Context, params: BaseRequestAPICall, browser: Brow
   if (userAgent) {
     log.debug(`Using custom UA: ${userAgent}`)
     await page.setUserAgent(userAgent)
+  }
+
+  if (download) {
+    // @ts-ignore
+    await page._client.send('Page.setDownloadBehavior', { behavior: 'allow' });
   }
 
   if (headers) {
