@@ -5,6 +5,9 @@ import log from './log'
 import { Browser, SetCookie, Request, Page, Headers, HttpMethod, Overrides } from 'puppeteer'
 import getCaptchaSolver, { CaptchaType } from './captcha'
 import { Context } from 'vm'
+import * as tmp from 'tmp';
+import * as fs from 'fs';
+import * as path from 'path';
 
 export interface BaseAPICall {
   cmd: string
@@ -65,16 +68,17 @@ interface OverrideResolvers {
 const CHALLENGE_SELECTORS = ['.ray_id', '.attack-box']
 const TOKEN_INPUT_NAMES = ['g-recaptcha-response', 'h-captcha-response']
 
-async function resolveChallenge(ctx: RequestContext, { url, maxTimeout, proxy, download }: BaseRequestAPICall, page: Page): Promise<ChallengeResolutionT | void> {
+async function resolveChallenge(ctx: RequestContext, { url, maxTimeout, proxy, download }: BaseRequestAPICall, page: Page, downloadPath: string): Promise<ChallengeResolutionT | void> {
 
   maxTimeout = maxTimeout || 60000
+  let downloadsFound = false
   let status = 'ok'
   let message = ''
 
   if (proxy) {
-    log.debug("Apply proxy");
+    log.debug("Apply proxy")
     if (proxy.username)
-      await page.authenticate({ username: proxy.username, password: proxy.password });
+      await page.authenticate({ username: proxy.username, password: proxy.password })
   }
 
   log.debug(`Navegating to... ${url}`)
@@ -105,12 +109,19 @@ async function resolveChallenge(ctx: RequestContext, { url, maxTimeout, proxy, d
               await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 })
             } catch (error) { }
 
-            const cfChallengeElem = await page.$(selector)
-            if (!cfChallengeElem) { break }
-            log.debug('Found challenge element again...')
+            // Do not refresh if a download is currently running
+            if (fs.readdirSync(downloadPath).length > 0) {
+              console.debug('Found a download running, stopping challenge resolution')
+              downloadsFound = true
+              break
+            } else {
+              const cfChallengeElem = await page.$(selector)
+              if (!cfChallengeElem) { break }
+              log.debug('Found challenge element again...')
 
-            response = await page.reload({ waitUntil: 'domcontentloaded' })
-            log.debug('Reloaded page...')
+              response = await page.reload({ waitUntil: 'domcontentloaded' })
+              log.debug('Reloaded page...')
+            }
           }
 
           if (Date.now() - ctx.startTimestamp >= maxTimeout) {
@@ -197,14 +208,19 @@ async function resolveChallenge(ctx: RequestContext, { url, maxTimeout, proxy, d
     }
   }
 
-  if (download) {
-    // for some reason we get an error unless we reload the page
-    // has something to do with a stale buffer and this is the quickest
-    // fix since I am short on time
-    response = await page.goto(url, { waitUntil: 'domcontentloaded' })
-    payload.result.response = (await response.buffer()).toString('base64')
-  } else {
-    payload.result.response = await page.content()
+  payload.result.response = await page.content()
+
+  // If we were waiting for a download then consider it's a 200
+  if (downloadsFound) {
+    // Check that the download is done
+    while (fs.readdirSync(downloadPath).filter(name => !name.endsWith('.crdownload')).length < 1) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    const fileName = fs.readdirSync(downloadPath)[0]
+    const filePath = path.join(downloadPath, fileName)
+
+    payload.result.status = 200
+    payload.result.response = fs.readFileSync(filePath).toString('base64')
   }
 
   // make sure the page is closed becaue if it isn't and error will be thrown
@@ -224,7 +240,7 @@ function mergeSessionWithParams({ defaults }: SessionsCacheItem, params: BaseReq
   return copy
 }
 
-async function setupPage(ctx: Context, params: BaseRequestAPICall, browser: Browser): Promise<Page> {
+async function setupPage(ctx: Context, params: BaseRequestAPICall, browser: Browser, downloadPath: string): Promise<Page> {
   const page = await browser.newPage()
 
   // merge session defaults with params
@@ -249,7 +265,7 @@ async function setupPage(ctx: Context, params: BaseRequestAPICall, browser: Brow
 
   if (download) {
     // @ts-ignore
-    await page._client.send('Page.setDownloadBehavior', { behavior: 'allow' });
+    await page._client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath })
   }
 
   if (headers) {
@@ -331,8 +347,26 @@ export const routes: Routes = {
 
     params = mergeSessionWithParams(session, params)
 
-    const page = await setupPage(ctx, params, session.browser)
-    const data = await resolveChallenge(ctx, params, page)
+    let downloadPath = null
+    let downloadPathName: string = null
+
+    if (params.download) {
+      downloadPath = tmp.dirSync()
+      downloadPathName = downloadPath.name
+      console.debug('Temporary download folder: ', downloadPath.name)
+    }
+
+    const page = await setupPage(ctx, params, session.browser, downloadPathName)
+    const data = await resolveChallenge(ctx, params, page, downloadPathName)
+
+    if (params.download) {
+      fs.readdirSync(downloadPathName).forEach(file => {
+        const filePath = path.join(downloadPathName, file);
+        console.debug(filePath)
+        fs.unlinkSync(filePath)
+      })
+      downloadPath.removeCallback()
+    }
 
     if (data) {
       const { status } = data
