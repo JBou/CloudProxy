@@ -2,7 +2,7 @@ import { v1 as UUIDv1 } from 'uuid'
 import sessions, { SessionsCacheItem } from './session'
 import { RequestContext } from './types'
 import log from './log'
-import { Browser, SetCookie, Request, Page, Headers, HttpMethod, Overrides } from 'puppeteer'
+import { Browser, SetCookie, Request, Page, Headers, HttpMethod, Overrides, Response } from 'puppeteer'
 import getCaptchaSolver, { CaptchaType } from './captcha'
 import { Context } from 'vm'
 import * as tmp from 'tmp';
@@ -81,11 +81,23 @@ async function resolveChallenge(ctx: RequestContext, { url, maxTimeout, proxy, d
       await page.authenticate({ username: proxy.username, password: proxy.password })
   }
 
-  log.debug(`Navegating to... ${url}`)
-  let response = await page.goto(url, { waitUntil: 'domcontentloaded' })
+  let response: Response | void
+  let loadFailed = false
+  log.debug(`Navigating to... ${url}`)
+  await page.goto(url, { waitUntil: 'load' }).catch(() => {loadFailed = true}).then(r => response = r)
+
+  if (download && loadFailed) {
+    // It may have started a download while the page failed to load
+    await page.waitFor(1000)
+  }
+
+  if (download && fs.readdirSync(downloadPath).length > 0) {
+    console.debug('Found a download running, stopping challenge resolution')
+    downloadsFound = true
+  }
 
   // look for challenge
-  if (response.headers().server.startsWith('cloudflare')) {
+  if (!downloadsFound && response && response.headers().server.startsWith('cloudflare')) {
     log.info('Cloudflare detected')
 
     if (await page.$('.cf-error-code')) {
@@ -200,8 +212,8 @@ async function resolveChallenge(ctx: RequestContext, { url, maxTimeout, proxy, d
     message,
     result: {
       url: page.url(),
-      status: response.status(),
-      headers: response.headers(),
+      status: response ? response.status(): 500,
+      headers: response ? response.headers() : {},
       response: null,
       cookies: await page.cookies(),
       userAgent: await page.evaluate(() => navigator.userAgent)
